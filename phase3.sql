@@ -60,6 +60,18 @@ from appointment as a left join person as ps on a.patientId = ps.ssn    
 cross join symptom as s on a.apptTime = s.apptTime and a.apptDate = s.apptDate      #get symptoms
 group by a.PatientId, a.apptDate, a.apptTime ;
 
+-- karan
+create or replace view symptoms_overview_view as
+select a.patientId as ssn,
+concat(per.firstName, per.lastName) as fullName,
+a.apptDate as apptDate,
+a.apptTime as apptTime,
+group_concat(s.symptomType order by s.symptomType) as symptoms
+from appointment a
+join symptom s on s.patientId = a.patientId and s.apptDate  = a.apptDate and s.apptTime  = a.apptTime
+join person per on per.ssn = a.patientId
+group by a.patientId, per.firstName, per.lastName, a.apptDate, a.apptTime;
+
 -- [3] medical_staff_view()
 -- -----------------------------------------------------------------------------
 /* This view displays information about medical staff. For every nurse and doctor, it displays
@@ -70,7 +82,32 @@ comma and a space (HINT: the GROUP_CONCAT function can be useful here), and thei
 being either the number of rooms they're assigned to or the number of appointments they're assigned to. */
 -- -----------------------------------------------------------------------------
 create or replace view medical_staff_view as
-select '_';
+select
+d.ssn as ssn,
+'doctor' as staffType,
+cast(d.licenseNumber as char(100)) as licenseInfo,
+cast(d.experience    as char(100)) as jobInfo,
+ifnull(group_concat(distinct dept.longName order by dept.longName separator ', '), '') as departments,
+count(distinct concat(aa.patientId, aa.apptDate, aa.apptTime)) as numAssignments
+from doctor d
+left join works_in wi on wi.staffSsn = d.ssn
+left join department dept on dept.deptId = wi.deptId
+left join appt_assignment aa on aa.doctorId = d.ssn
+group by d.ssn, d.licenseNumber, d.experience
+union all
+
+select
+n.ssn as ssn,
+'nurse' as staffType,
+cast(n.regExpiration as char(100)) as licenseInfo,
+cast(n.shiftType    as char(100)) as jobInfo,
+ifnull(group_concat(distinct dept.longName order by dept.longName separator ', '), '') as departments,
+count(distinct ra.roomNumber) as numAssignments
+from nurse n
+left join works_in wi on wi.staffSsn = n.ssn
+left join department dept on dept.deptId = wi.deptId
+left join room_assignment ra on ra.nurseId = n.ssn
+group by n.ssn, n.regExpiration, n.shiftType;
 
 -- [4] department_view()
 -- -----------------------------------------------------------------------------
@@ -92,7 +129,17 @@ appointments, orders for a patient (HINT: the IFNULL or COALESCE functions can b
 useful here).  */
 -- -----------------------------------------------------------------------------
 create or replace view outstanding_charges_view as
-select '_';
+select
+per.firstName as firstName,
+per.lastName as lastName,
+p.ssn as ssn,
+p.funds as funds,
+ifnull(a.apptCharges, 0) + ifnull(b.orderCharges, 0) as outstandingCharges,
+ifnull(a.numAppointments, 0) as numAppointments,
+ifnull(b.numOrders, 0) as numOrders from patient p join person per on per.ssn = p.ssn
+left join (select patientId, count(*) as numAppointments, sum(cost) as apptCharges from appointment group by patientId) a on a.patientId = p.ssn
+left join (select patientId, count(*) as numOrders, sum(cost) as orderCharges from med_order group by patientId) b on b.patientId = p.ssn;
+
 
 -- -------------------
 -- Stored Procedures
@@ -172,7 +219,28 @@ create procedure book_appointment (
 	in ip_apptCost integer
 )
 sp_main: begin
-
+	declare v_funds integer default 0;
+    declare v_appt_sum integer default 0;
+    declare v_order_sum integer default 0;
+    declare v_needed integer default 0;
+    if ip_patientId is null or ip_apptDate is null or ip_apptTime is null or ip_apptCost is null then leave sp_main;
+    end if;
+    if ip_apptCost < 0 then leave sp_main;
+    end if;
+    if not exists (select 1 from patient where ssn = ip_patientId) then leave sp_main;
+    end if;
+    if ip_apptDate < curdate() or (ip_apptDate = curdate() and ip_apptTime <= curtime()) then leave sp_main;
+    end if;
+    if exists (select 1 from appointment where patientId = ip_patientId and apptDate = ip_apptDate and apptTime = ip_apptTime) then leave sp_main;
+    end if;
+    select funds into v_funds from patient where ssn = ip_patientId;
+	select ifnull(sum(cost), 0) into v_appt_sum from appointment where patientId = ip_patientId;
+	select ifnull(sum(cost), 0) into v_order_sum from med_order where patientId = ip_patientId;
+    set v_needed = v_appt_sum + v_order_sum + ip_apptCost;
+    if v_funds < v_needed then leave sp_main;
+    end if;
+    insert into appointment (patientId, apptDate, apptTime, cost)
+    values (ip_patientId, ip_apptDate, ip_apptTime, ip_apptCost);
 end /​/
 delimiter ;
 
@@ -209,7 +277,41 @@ create procedure place_order (
     in ip_dosage int
 )
 sp_main: begin
-	-- code here
+	declare v_funds integer default 0;
+    declare v_appt_sum integer default 0;
+    declare v_order_sum integer default 0;
+    declare v_needed integer default 0;
+    declare v_is_lab integer default 0;
+    declare v_is_rx integer default 0;
+    if ip_orderNumber is null or ip_priority is null or ip_patientId is null or ip_doctorId is null or ip_cost is null then leave sp_main;
+    end if;
+    if ip_orderNumber <= 0 or ip_cost < 0 then leave sp_main;
+    end if;
+    if exists (select 1 from med_order where orderNumber = ip_orderNumber) then leave sp_main;
+    end if;
+    if not exists (select 1 from patient where ssn = ip_patientId) then leave sp_main;
+    end if;
+    if not exists (select 1 from doctor where ssn = ip_doctorId) then leave sp_main;
+    end if;
+    set v_is_lab = case when ip_labType is not null and ip_drug is null and ip_dosage is null then 1 else 0 
+	end;
+    set v_is_rx  = case when ip_labType is null and ip_drug is not null and ip_dosage is not null then 1 else 0
+	end;
+    if v_is_lab + v_is_rx <> 1 then leave sp_main;
+    end if;
+    if v_is_rx = 1 and ip_dosage <= 0 then leave sp_main;
+    end if;
+    select funds into v_funds from patient where ssn = ip_patientId;
+    select ifnull(sum(cost), 0) into v_appt_sum from appointment where patientId = ip_patientId;
+    select ifnull(sum(cost), 0) into v_order_sum from med_order where patientId = ip_patientId;
+    set v_needed = v_appt_sum + v_order_sum + ip_cost;
+    if v_funds < v_needed then leave sp_main;
+    end if;
+    insert into med_order (orderNumber, orderDate, priority, patientId, doctorId, cost)
+    values (ip_orderNumber, curdate(), ip_priority, ip_patientId, ip_doctorId, ip_cost);
+    if v_is_lab = 1 then insert into lab_work (orderNumber, labType) values (ip_orderNumber, ip_labType);
+    else insert into prescription (orderNumber, drug, dosage) values (ip_orderNumber, ip_drug, ip_dosage);
+    end if;
 end /​/
 delimiter ;
 
@@ -237,7 +339,20 @@ create procedure add_staff_to_dept (
     in ip_salary integer
 )
 sp_main: begin
-	-- code here
+    if ip_deptId is null or ip_ssn is null or ip_firstName is null or ip_lastName is null or ip_birthdate is null or ip_startdate is null or ip_address is null or ip_staffId  is null or ip_salary is null then leave sp_main;
+    end if;
+    if not exists (select 1 from department where deptId = ip_deptId) then leave sp_main;
+    end if;
+    if exists (select 1 from department where manager = ip_ssn and deptId <> ip_deptId) then leave sp_main;
+    end if;
+    if not exists (select 1 from person where ssn = ip_ssn) then insert into person (ssn, firstName, lastName, birthdate, address) values (ip_ssn, ip_firstName, ip_lastName, ip_birthdate, ip_address);
+    end if;
+    if not exists (select 1 from staff where ssn = ip_ssn) then insert into staff (ssn, staffId, hireDate, salary) values (ip_ssn, ip_staffId, ip_startdate, ip_salary);
+    end if;
+    if exists (select 1 from works_in where staffSsn = ip_ssn and deptId   = ip_deptId) then leave sp_main;
+    end if;
+    insert into works_in (staffSsn, deptId)
+    values (ip_ssn, ip_deptId);
 end /​/
 delimiter ;
 
@@ -328,7 +443,28 @@ create procedure assign_doctor_to_appointment (
     in ip_doctorId char(11)
 )
 sp_main: begin
-	-- code here
+    declare v_count integer default 0;
+    if ip_patientId is null or ip_apptDate is null or ip_apptTime is null or ip_doctorId is null then
+    leave sp_main;
+    end if;
+    if not exists (select 1 from appointment where patientId = ip_patientId and apptDate = ip_apptDate and apptTime = ip_apptTime) 
+	then leave sp_main;
+    end if;
+    if not exists (select 1 from doctor where ssn = ip_doctorId) then leave sp_main;
+    end if;
+    if exists (select 1 from appt_assignment where patientId = ip_patientId and apptDate = ip_apptDate and apptTime = ip_apptTime and doctorId = ip_doctorId) 
+	then leave sp_main;
+    end if;
+    select count(*) into v_count
+    from appt_assignment
+    where patientId = ip_patientId and apptDate = ip_apptDate and apptTime = ip_apptTime;
+    if v_count >= 3 then leave sp_main;
+    end if;
+    if exists (select 1 from appt_assignment aa where aa.doctorId = ip_doctorId and aa.apptDate = ip_apptDate and aa.apptTime = ip_apptTime) 
+	then leave sp_main;
+    end if;
+    insert into appt_assignment (patientId, apptDate, apptTime, doctorId)
+    values (ip_patientId, ip_apptDate, ip_apptTime, ip_doctorId);
 end /​/
 delimiter ;
 

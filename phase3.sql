@@ -53,15 +53,6 @@ and a list of symptoms recorded during the appointment with each symptom separat
 comma and a space (HINT: the GROUP_CONCAT function can be useful here). */
 -- -----------------------------------------------------------------------------
 create or replace view symptoms_overview_view as
-select a.patientId, concat(ps.firstName,' ',ps.lastName)
-, a.apptTime, a.apptDate
-, group_concat(s.symptomType separator ', ')
-from appointment as a left join person as ps on a.patientId = ps.ssn                #get full name, ssn, date, and time
-cross join symptom as s on a.apptTime = s.apptTime and a.apptDate = s.apptDate      #get symptoms
-group by a.PatientId, a.apptDate, a.apptTime ;
-
--- karan
-create or replace view symptoms_overview_view as
 select a.patientId as ssn,
 concat(per.firstName, per.lastName) as fullName,
 a.apptDate as apptDate,
